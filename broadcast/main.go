@@ -3,20 +3,35 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"slices"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+type BroadcastMessage struct {
+	Type    string `json:"type"`
+	Message int    `json:"message"`
+}
+
 type GossipMessage struct {
-	Type         string   `json:"type"`
-	NodesWhoKnow []string `json:"nodes_who_know"`
-	Message      int      `json:"message"`
+	Type     string `json:"type"`
+	Messages []int  `json:"messages"`
+}
+
+type TopologyMessage struct {
+	Type     string              `json:"type"`
+	Topology map[string][]string `json:"topology"`
+}
+
+type PeerMessage struct {
+	Peer    string
+	Message int
 }
 
 type state struct {
-	seen  map[int]struct{}
-	peers []string
+	seen    map[int]struct{}
+	pending map[PeerMessage]struct{}
+	peers   []string
 }
 
 type command func(*state)
@@ -26,16 +41,62 @@ func main() {
 	commands := make(chan command)
 
 	go func() {
-		s := &state{seen: make(map[int]struct{})}
+		s := &state{
+			seen:    make(map[int]struct{}),
+			pending: make(map[PeerMessage]struct{}),
+		}
 		for cmd := range commands {
 			cmd(s)
 		}
 	}()
 
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body struct {
-			Topology map[string][]string `json:"topology"`
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			peerMessagesCh := make(chan map[string][]int, 1)
+			commands <- func(s *state) {
+				out := make(map[string][]int)
+				for peerMessage, _ := range s.pending {
+					out[peerMessage.Peer] = append(out[peerMessage.Peer], peerMessage.Message)
+				}
+
+				peerMessagesCh <- out
+			}
+
+			peerMessages := <-peerMessagesCh
+			for peer, messages := range peerMessages {
+				if len(messages) == 0 {
+					continue
+				}
+
+				body := GossipMessage{
+					Type:     "gossip",
+					Messages: messages,
+				}
+				n.RPC(peer, body, func(msg maelstrom.Message) error {
+					var body map[string]any
+					if err := json.Unmarshal(msg.Body, &body); err != nil {
+						return err
+					}
+
+					commands <- func(s *state) {
+						if body["type"] == "gossip_ok" {
+							for _, message := range messages {
+								delete(s.pending, PeerMessage{peer, message})
+							}
+						}
+					}
+
+					return nil
+				})
+			}
 		}
+	}()
+
+	n.Handle("topology", func(msg maelstrom.Message) error {
+		var body TopologyMessage
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
@@ -43,6 +104,7 @@ func main() {
 		commands <- func(s *state) {
 			s.peers = body.Topology[n.ID()]
 		}
+
 		return n.Reply(msg, map[string]any{"type": "topology_ok"})
 	})
 
@@ -60,15 +122,12 @@ func main() {
 	})
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		var body struct {
-			Message int `json:"message"`
-		}
+		var body BroadcastMessage
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		gossip(n, commands, body.Message, []string{n.ID()})
-
+		syncState(commands, []int{body.Message}, msg.Src)
 		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
 	})
 
@@ -78,9 +137,8 @@ func main() {
 			return err
 		}
 
-		gossip(n, commands, body.Message, append(body.NodesWhoKnow, n.ID()))
-
-		return nil
+		syncState(commands, body.Messages, msg.Src)
+		return n.Reply(msg, map[string]any{"type": "gossip_ok"})
 	})
 
 	if err := n.Run(); err != nil {
@@ -88,26 +146,22 @@ func main() {
 	}
 }
 
-func gossip(n *maelstrom.Node, commands chan<- command, message int, whoKnows []string) {
-	targets := make(chan []string, 1)
+func syncState(commands chan<- command, messages []int, sender string) {
 	commands <- func(s *state) {
-		if _, dup := s.seen[message]; dup {
-			targets <- nil
-			return
+		for _, message := range messages {
+			syncPending(s, message, sender)
+			s.seen[message] = struct{}{}
 		}
-		s.seen[message] = struct{}{}
+	}
+}
 
-		var out []string
+func syncPending(s *state, message int, sender string) {
+	if _, dup := s.seen[message]; !dup {
 		for _, peer := range s.peers {
-			if !slices.Contains(whoKnows, peer) {
-				out = append(out, peer)
+			if sender != peer {
+				peerMessage := PeerMessage{peer, message}
+				s.pending[peerMessage] = struct{}{}
 			}
 		}
-		targets <- out
-	}
-
-	body := GossipMessage{Type: "gossip", NodesWhoKnow: whoKnows, Message: message}
-	for _, peer := range <-targets {
-		n.Send(peer, body)
 	}
 }
