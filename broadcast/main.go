@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"math"
+	"slices"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -31,7 +33,7 @@ type PeerMessage struct {
 type state struct {
 	seen    map[int]struct{}
 	pending map[PeerMessage]struct{}
-	peers   []string
+	peers   map[string]bool
 }
 
 type command func(*state)
@@ -51,7 +53,7 @@ func main() {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(time.Second / 20)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -95,16 +97,14 @@ func main() {
 		}
 	}()
 
+	n.Handle("init", func(msg maelstrom.Message) error {
+		nodeIDs := n.NodeIDs()
+		peers := buildPeers(nodeIDs, n.ID())
+		commands <- func(s *state) { s.peers = peers }
+		return nil
+	})
+
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body TopologyMessage
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		commands <- func(s *state) {
-			s.peers = body.Topology[n.ID()]
-		}
-
 		return n.Reply(msg, map[string]any{"type": "topology_ok"})
 	})
 
@@ -157,11 +157,39 @@ func syncState(commands chan<- command, messages []int, sender string) {
 
 func syncPending(s *state, message int, sender string) {
 	if _, dup := s.seen[message]; !dup {
-		for _, peer := range s.peers {
+		senderIsLeader := s.peers[sender]
+		for peer, leader := range s.peers {
+			if senderIsLeader && leader {
+				continue
+			}
+
 			if sender != peer {
 				peerMessage := PeerMessage{peer, message}
 				s.pending[peerMessage] = struct{}{}
 			}
 		}
 	}
+}
+
+func buildPeers(nodeIDs []string, me string) map[string]bool {
+	peers := make(map[string]bool)
+	position := slices.Index(nodeIDs, me)
+	groupSize := int(math.Floor(math.Sqrt(float64(len(nodeIDs)))))
+	positionAboutLeader := position % groupSize
+
+	if positionAboutLeader == 0 {
+		for i, node := range nodeIDs {
+			if i%groupSize == 0 && node != me {
+				peers[node] = true
+			}
+			if i > position && i < position+groupSize {
+				peers[node] = false
+			}
+		}
+
+	} else {
+		peers[nodeIDs[position-positionAboutLeader]] = true
+	}
+
+	return peers
 }
